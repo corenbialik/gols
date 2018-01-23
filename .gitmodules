@@ -1,0 +1,9 @@
+[submodule "external/moderngpu"]
+	path = external/moderngpu
+	url = https://github.com/moderngpu/moderngpu.git
+[submodule "external/pybind11"]
+	path = external/pybind11
+	url = https://github.com/pybind/pybind11.git
+[submodule "external/cub"]
+	path = external/cub
+	url = https://github.com/NVlabs/cub.git
