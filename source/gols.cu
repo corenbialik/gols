@@ -70,6 +70,8 @@ template <typename T> struct block_sum_t {
 // Solve the linear system `A` x = `b` using QR factorization.
 // Only supports the case where the system is not over-determined, which is
 // okay since we're trying to do _sparse_ approximation here.
+// The contents of "A" will get overwritten, the contents of "B" will be
+// the solution vector "x".
 // Pulled largely from
 // http://docs.nvidia.com/cuda/cusolver/index.html#ormqr-example1
 void sgels(float *A,
@@ -160,8 +162,8 @@ void compute_DA(float const *D,
   auto kernel = [] MGPU_DEVICE(int tid, int cta, float const *D, float const *A,
                                int n, int l, float *da, unsigned int *done) {
 
-    __shared__ float reduced[32];
-    if (tid < 32)
+    __shared__ float reduced[warpSize];
+    if (tid < warpSize)
       reduced[tid] = 0;
     __syncthreads();
 
@@ -240,8 +242,8 @@ std::vector<unsigned int> compute_gamma(float const *Pa,
 
   auto kernel = [] MGPU_DEVICE(int tid, int cta, float const *Pa, int n,
                                float const *signal, float *gamma, int L) {
-    __shared__ float reduced[32];
-    if (tid < 32)
+    __shared__ float reduced[warpSize];
+    if (tid < warpSize)
       reduced[tid] = 0;
     __syncthreads();
 
@@ -380,6 +382,7 @@ gols_solve(float const *dictionary,
   assert(cudaSuccess == error);
 
   std::vector<int> I(m);
+  // initial set of columns
   std::iota(I.begin(), I.end(), 0);
   std::vector<int> S;
 
