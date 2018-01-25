@@ -40,9 +40,11 @@
 #endif
 
 namespace {
+enum { WARPSIZE = 32 };
+
 // Simple block reduction.
 // Needs to be initialized with a __shared__ buffer of size no less than
-// ceil(blockDim.x / warpSize)
+// ceil(blockDim.x / WARPSIZE)
 template <typename T> struct block_sum_t {
   T *reduced;
   __device__ block_sum_t(T *reduced) : reduced(reduced) {}
@@ -50,8 +52,8 @@ template <typename T> struct block_sum_t {
   __device__ T sum(T item) {
     int const warp_id = threadIdx.x >> 5;
     int const lane    = threadIdx.x & 0x1f;
-    for (int o = warpSize / 2; o > 0; o >>= 1) {
-      item += __shfl_xor_sync(0xffffffff, item, o, warpSize);
+    for (int o = WARPSIZE / 2; o > 0; o >>= 1) {
+      item += __shfl_xor_sync(0xffffffff, item, o, WARPSIZE);
     }
     if (!lane) {
       reduced[warp_id] = item;
@@ -59,8 +61,8 @@ template <typename T> struct block_sum_t {
     __syncthreads();
     if (!warp_id) {
       item = reduced[lane];
-      for (int o = warpSize / 2; o > 0; o >>= 1) {
-        item += __shfl_xor_sync(0xffffffff, item, o, warpSize);
+      for (int o = WARPSIZE / 2; o > 0; o >>= 1) {
+        item += __shfl_xor_sync(0xffffffff, item, o, WARPSIZE);
       }
     }
     return item;
@@ -162,8 +164,8 @@ void compute_DA(float const *D,
   auto kernel = [] MGPU_DEVICE(int tid, int cta, float const *D, float const *A,
                                int n, int l, float *da, unsigned int *done) {
 
-    __shared__ float reduced[warpSize];
-    if (tid < warpSize)
+    __shared__ float reduced[WARPSIZE];
+    if (tid < WARPSIZE)
       reduced[tid] = 0;
     __syncthreads();
 
@@ -242,8 +244,8 @@ std::vector<unsigned int> compute_gamma(float const *Pa,
 
   auto kernel = [] MGPU_DEVICE(int tid, int cta, float const *Pa, int n,
                                float const *signal, float *gamma, int L) {
-    __shared__ float reduced[warpSize];
-    if (tid < warpSize)
+    __shared__ float reduced[WARPSIZE];
+    if (tid < WARPSIZE)
       reduced[tid] = 0;
     __syncthreads();
 
