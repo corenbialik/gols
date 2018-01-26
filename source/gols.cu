@@ -328,15 +328,10 @@ void compact_dictonary(float const *A,
   auto kernel = [] MGPU_DEVICE(int tid, int cta, float const *A, float *newA,
                                unsigned int const *indices, int m, int n,
                                int L) {
-    int current = 0;
-    int removed = indices[current];
+    int offset = 0;
+    for ( ; offset < L and indices[offset] <= (cta + offset); ++offset);
 
-    for (; current < L; ++current, removed = indices[current]) {
-      if (removed > (cta + current))
-        break;
-    }
-
-    float const *arow = A + (cta + current) * n;
+    float const *arow = A + (cta + offset) * n;
     float *arow_new   = newA + cta * n;
 
     for (int i = tid; i < n; i += blockDim.x) {
@@ -419,6 +414,7 @@ gols_solve(float const *dictionary,
       update_D(P.data(), d.data(), n, context);
     }
 
+    std::sort(L_largest_indices.begin(), L_largest_indices.end());
     error = mgpu::htod(device_largest_indices.data(), L_largest_indices);
     assert(cudaSuccess == error);
     compact_dictonary(A.data(), temp.data(), device_largest_indices.data(), ms,
