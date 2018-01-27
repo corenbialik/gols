@@ -234,13 +234,13 @@ void update_D(float *D, float const *d, int n, mgpu::context_t &context) {
 }
 
 // This computes |dot(`signal`, `Pa`_j)| for j in I.
-std::vector<unsigned int> compute_gamma(float const *Pa,
-                                        int m,
-                                        int n,
-                                        float const *signal,
-                                        mgpu::mem_t<float> &gamma,
-                                        int L,
-                                        mgpu::context_t &context) {
+std::vector<unsigned int> compute_largest_projection(float const *Pa,
+                                                     int m,
+                                                     int n,
+                                                     float const *signal,
+                                                     mgpu::mem_t<float> &gamma,
+                                                     int L,
+                                                     mgpu::context_t &context) {
 
   auto kernel = [] MGPU_DEVICE(int tid, int cta, float const *Pa, int n,
                                float const *signal, float *gamma, int L) {
@@ -318,18 +318,19 @@ void gather_dictionary(float const *A,
 
 // Remove the `L` rows specified in `indices` from the dictionary `A`.
 // The result is a new dictionary `newA` with `m - L` entries of size `n`.
-void compact_dictonary(float const *A,
-                       float *newA,
-                       unsigned int const *indices,
-                       int m,
-                       int n,
-                       int L,
-                       mgpu::context_t &context) {
+void compact_dictionary(float const *A,
+                        float *newA,
+                        unsigned int const *indices,
+                        int m,
+                        int n,
+                        int L,
+                        mgpu::context_t &context) {
   auto kernel = [] MGPU_DEVICE(int tid, int cta, float const *A, float *newA,
                                unsigned int const *indices, int m, int n,
                                int L) {
     int offset = 0;
-    for ( ; offset < L and indices[offset] <= (cta + offset); ++offset);
+    for (; offset < L and indices[offset] <= (cta + offset); ++offset)
+      ;
 
     float const *arow = A + (cta + offset) * n;
     float *arow_new   = newA + cta * n;
@@ -392,10 +393,11 @@ gols_solve(float const *dictionary,
 
     assert(CUBLAS_STATUS_SUCCESS == status);
 
-    // FIXME why would you call this compute_gamma if it returns the largest
+    // FIXME why would you call this compute_largest_projection if it returns
+    // the largest
     // indices.
-    auto L_largest_indices =
-        compute_gamma(Pa.data(), ms, n, y.data(), gamma, L, context);
+    auto L_largest_indices = compute_largest_projection(
+        Pa.data(), ms, n, y.data(), gamma, L, context);
 
     // Next, add these L largest colums (given in local indexing) to the
     // sparse set S and remove them from I.
@@ -417,8 +419,8 @@ gols_solve(float const *dictionary,
     std::sort(L_largest_indices.begin(), L_largest_indices.end());
     error = mgpu::htod(device_largest_indices.data(), L_largest_indices);
     assert(cudaSuccess == error);
-    compact_dictonary(A.data(), temp.data(), device_largest_indices.data(), ms,
-                      n, L, context);
+    compact_dictionary(A.data(), temp.data(), device_largest_indices.data(), ms,
+                       n, L, context);
     A.swap(temp);
   }
 
