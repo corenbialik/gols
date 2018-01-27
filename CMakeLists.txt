@@ -29,3 +29,8 @@ target_link_libraries(gols ${CUDA_cusolver_LIBRARY})
 pybind11_add_module(_gols
                     source/pygols.cxx)
 target_link_libraries(_gols gols)
+
+cuda_add_executable(play
+                    play/example.cxx)
+target_link_libraries(play gols)
+
