@@ -1,32 +1,27 @@
-// Copyright (c) 2017, Coren Bialik
-// -----------------------------------------------------------------------------
-// Generalized Orthogonal Least-Squares (GOLS)
-// -----------------------------------------------------------------------------
+// Copyright (c) 2018, Coren Bialik
+// All rights reserved.
 //
-// This is a CUDA implementation of GOLS as described in
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
 //
-// A. Hashemi and H. Vikalo,
-//   "Sparse linear regression via generalized orthogonal least-squares,"
-//   2016 IEEE Global Conference on Signal and Information Processing,
-//   Washington, DC, 2016, pp. 1305-1309.
+// 1. Redistributions of source code must retain the above copyright notice,
+//    this list of conditions and the following disclaimer.
+// 2. Redistributions in binary form must reproduce the above copyright notice,
+//    this list of conditions and the following disclaimer in the documentation
+//    and/or other materials provided with the distribution.
 //
-// https://arxiv.org/pdf/1602.06916.pdf
-//
-// Input: signal(shape=[n]), dictionary A(shape=[m,n]), and sparsity k, L
-//
-// D = identity(n)
-// I = range(m)
-// for i in range(min(k, floor(m / L))):
-//      gamma = |dot(signal, D.dot(a)/mag(D.dot(a))| for a in A
-//      J = argsort(gamma)[-L:]
-//      largest_indices = I[j] for j in J
-//      S.insert(i) for i in largest_indices
-//      I.remove(i) for i in largest_indices
-//      for j in largest_indices:
-//          Da = D.dot(A[j,:])
-//          D = D - outer(normalize(Da), normalize(Da))
-//      A = [A[i,:] for i in range(len(I)) if i not in largest_indices]
-//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
 #include "caching_context.hxx"
 #include "gols.hxx"
 #include <cublas_v2.h>
@@ -40,6 +35,7 @@
 #endif
 
 namespace {
+
 enum { WARPSIZE = 32 };
 
 // Simple block reduction.
@@ -153,6 +149,8 @@ __device__ __forceinline__ void kahan_add(float &sum, float &c, float value) {
   sum     = t;
 }
 
+// Compute `da = D.dot(A[l])/norm(D.dot(A[l]))`, where `D` is a `n` x `n`
+// matrix, and `A` is our dictionary.
 void compute_DA(float const *D,
                 float const *A,
                 int n,
@@ -218,7 +216,8 @@ void compute_DA(float const *D,
   mgpu::cta_launch<256>(kernel, num_ctas, context, D, A, n, l, da, done);
 }
 
-// D <- D - outer(Da_j, Da_j) for i in range(L)
+// The `n` x `n` matrix `D` is updated in-place as:
+// `D -= outer(d, d)`.
 void update_D(float *D, float const *d, int n, mgpu::context_t &context) {
   auto kernel = [] MGPU_DEVICE(int tid, int cta, float *D, float const *d,
                                int n) {
@@ -233,7 +232,10 @@ void update_D(float *D, float const *d, int n, mgpu::context_t &context) {
   mgpu::cta_launch<256>(kernel, num_ctas, context, D, d, n);
 }
 
-// This computes |dot(`signal`, `Pa`_j)| for j in I.
+// This computes the correlation of the projections with the signal we're
+// trying to reconstruct, viz.
+// `gamma[j] = |dot(signal, Pa[j])|` for all rows `j` in `Pa`, and returns
+// the indices of the `L` rows with the largest `gamma[j]`.
 std::vector<unsigned int> compute_largest_projection(float const *Pa,
                                                      int m,
                                                      int n,
@@ -292,7 +294,7 @@ void initialize_identity(float *P, int n, mgpu::context_t &context) {
   mgpu::cta_launch<256>(kernel, num_ctas, context, P, n);
 }
 
-// A_subset = [A[c, :] for c in columns],
+// Construct `A_subset = [A[c, :] for c in columns]`,
 // where `A` is a dictionary with atoms of size `n`, and `columns` is a list
 // of `num_columns` indices. `A_subset` be able to hold `num_columns` x `n`
 // entries.
@@ -316,8 +318,11 @@ void gather_dictionary(float const *A,
                         num_columns);
 }
 
-// Remove the `L` rows specified in `indices` from the dictionary `A`.
-// The result is a new dictionary `newA` with `m - L` entries of size `n`.
+// Create a new dictionary `newA` which consists of all the rows in `A`
+// except the `L` rows specified in `indices`. The original dictionary
+// has `m` rows, and `n` columns.
+// The list of rows `indices` must be sorted in ascending order, otherwise
+// this will give the wrong result.
 void compact_dictionary(float const *A,
                         float *newA,
                         unsigned int const *indices,
@@ -328,6 +333,8 @@ void compact_dictionary(float const *A,
   auto kernel = [] MGPU_DEVICE(int tid, int cta, float const *A, float *newA,
                                unsigned int const *indices, int m, int n,
                                int L) {
+    // Do a prefix sum on the fly to figure out where to gather the row
+    // from. Requires indices to be sorted.
     int offset = 0;
     for (; offset < L and indices[offset] <= (cta + offset); ++offset)
       ;
@@ -343,8 +350,9 @@ void compact_dictionary(float const *A,
   int const num_ctas = m - L;
   mgpu::cta_launch<256>(kernel, num_ctas, context, A, newA, indices, m, n, L);
 }
-}
+} // namespace
 
+// See interface description in header file.
 std::tuple<std::vector<int>, std::vector<float>>
 gols_solve(float const *dictionary,
            float const *signal,
@@ -444,4 +452,21 @@ gols_solve(float const *dictionary,
   assert(CUBLAS_STATUS_SUCCESS == status);
 
   return std::make_tuple(S, sparse_solution);
+}
+
+void gols_solve(float const *dictionary,
+                float const *signal,
+                int n,
+                int m,
+                int sparsity,
+                int L,
+                int *best_rows,
+                float *x,
+                bool solve_lstsq) {
+
+  auto result = gols_solve(dictionary, signal, n, m, sparsity, L, solve_lstsq);
+  std::copy(std::get<0>(result).begin(), std::get<0>(result).end(), best_rows);
+  assert(not solve_lstsq or x != nullptr);
+  if (solve_lstsq)
+    std::copy(std::get<1>(result).begin(), std::get<1>(result).end(), x);
 }
