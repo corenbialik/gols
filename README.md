@@ -1,4 +1,7 @@
 # Generalized Orthogonal Least Squares
+
+This is an implementation of [Generalized Orthogonal Least-Squares][gols] (GOLS) following Hashemi and Vikalo 
+
 https://arxiv.org/pdf/1602.06916.pdf
 
 Solve the following problem:
@@ -63,3 +66,5 @@ def gols_solve(dictionary, y, sparsity, L):
     xs, _, _, _ = numpy.linalg.lstsq(As, y)
     return S, xs
 ```
+
+[gols]: https://arxiv.org/pdf/1602.06916.pdf Sparse linear regression via generalized orthogonal least-squares
