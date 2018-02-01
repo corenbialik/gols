@@ -6,7 +6,8 @@ if (OPENMP_FOUND)
     set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 endif()
 
-set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS}--expt-extended-lambda -arch=sm_61 -use_fast_math")
+set(CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS}--expt-extended-lambda
+--gpu-architecture=compute_52 --gpu-code=compute_52,sm_61,sm_70 -use_fast_math")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -g -fPIC -O2")
 
 set(PYBIND11_PYTHON_VERSION 2.7)
