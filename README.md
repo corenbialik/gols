@@ -1,4 +1,4 @@
-# Generalized Orthogonal Least Squares
+# CUDA Generalized Orthogonal Least Squares
 
 [Coren Bialik](mailto:coren.bialik@protonmail.com), 2018.
 
