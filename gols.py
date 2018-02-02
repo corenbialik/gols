@@ -86,7 +86,7 @@ def _python_gols_solve(dictionary, y, k, L):
     I = range(m)
     for i in range(0, min(k, m / L)):
         Pa = numpy.array([P.dot(A[:, j]) for j in I])
-        Pa = numpy.divide(Pa, numpy.linalg.norm(Pa, axis=1)[:,None])
+        Pa = numpy.divide(Pa, numpy.linalg.norm(Pa, axis=1)[:, None])
         gamma = numpy.array([abs(y.dot(porta)) for porta in Pa])
         L_largest = gamma.argsort()[-L:]
         largest_indices = [I[j] for j in L_largest]
