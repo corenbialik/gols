@@ -142,13 +142,6 @@ n_largest(std::vector<T> const &data, int n, int m) {
   return kv;
 }
 
-__device__ __forceinline__ void kahan_add(float &sum, float &c, float value) {
-  float y = value - c;
-  float t = sum + y;
-  c       = (t - sum) - y;
-  sum     = t;
-}
-
 // Compute `da = D.dot(A[l])/norm(D.dot(A[l]))`, where `D` is a `n` x `n`
 // matrix, and `A` is our dictionary.
 void compute_DA(float const *D,
@@ -170,10 +163,9 @@ void compute_DA(float const *D,
     float const *d = D + cta * n;
     float const *a = A + l * n;
     float dot      = 0;
-    float dot_c    = 0;
 
     for (int i = tid; i < n; i += blockDim.x) {
-      kahan_add(dot, dot_c, a[i] * d[i]);
+      dot += a[i] * d[i];
     }
 
     dot = block_sum_t<float>(reduced).sum(dot);
@@ -195,9 +187,8 @@ void compute_DA(float const *D,
       return;
 
     dot   = 0;
-    dot_c = 0;
     for (int i = tid; i < n; i += blockDim.x) {
-      kahan_add(dot, dot_c, da[i] * da[i]);
+      dot += da[i] * da[i];
     }
     dot = block_sum_t<float>(reduced).sum(dot);
     if (!tid)
@@ -252,20 +243,20 @@ std::vector<unsigned int> compute_largest_projection(float const *Pa,
     __syncthreads();
 
     float const *pa = Pa + cta * n;
-    float2 dot      = make_float2(0, 0);
-    float2 norm     = make_float2(0, 0);
+    float dot = 0;
+    float norm = 0;
     for (int i = tid; i < n; i += blockDim.x) {
       float2 value = make_float2(signal[i], pa[i]);
-      kahan_add(dot.x, dot.y, value.x * value.y);
-      kahan_add(norm.x, norm.y, value.y * value.y);
+      dot += value.x * value.y;
+      norm += value.y * value.y;
     }
 
-    dot.x = block_sum_t<float>(reduced).sum(dot.x);
+    dot = block_sum_t<float>(reduced).sum(dot);
     __syncthreads();
-    norm.x = block_sum_t<float>(reduced).sum(norm.x);
+    norm = block_sum_t<float>(reduced).sum(norm);
 
     if (!tid) {
-      gamma[cta] = fabs(dot.x * rsqrt(norm.x));
+      gamma[cta] = fabs(dot * rsqrt(norm));
     }
   };
 
