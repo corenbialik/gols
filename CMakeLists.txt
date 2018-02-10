@@ -21,6 +21,7 @@ add_subdirectory("external/pybind11")
 
 cuda_add_library(gols SHARED
 	source/gols.cu
+  source/aols.cu
   source/caching_context.cu
 )
 CUDA_ADD_CUBLAS_TO_TARGET(gols)
