@@ -39,10 +39,12 @@ enum { WARPSIZE = 32 };
 template <int L> struct n_largest_t {
   mgpu::kv_array_t<float, uint, L> *reduced;
 
-  __device__ n_largest_t(mgpu::kv_array_t<float, uint, L> *buffer)
+  __device__ __forceinline__
+  n_largest_t(mgpu::kv_array_t<float, uint, L> *buffer)
       : reduced(buffer) {}
 
-  __device__ void warp_max(mgpu::kv_array_t<float, uint, L> &item) {
+  __device__ __forceinline__ void
+  warp_max(mgpu::kv_array_t<float, uint, L> &item) {
     mgpu::kv_array_t<float, uint, 2 * L> together;
     mgpu::iterate<L>([&](int l) {
       together.keys[l] = item.keys[l];
@@ -66,9 +68,9 @@ template <int L> struct n_largest_t {
   }
 
   // The first warp will have the L-largest items stored in item.
-  __device__ void max(mgpu::kv_array_t<float, uint, L> &item) {
+  __device__ __forceinline__ void max(mgpu::kv_array_t<float, uint, L> &item) {
     int const warp_id = threadIdx.x >> 5;
-    int const lane = threadIdx.x & 0x1f;
+    int const lane    = threadIdx.x & 0x1f;
     warp_max(item);
     if (!lane) {
       reduced[warp_id] = item;
@@ -90,7 +92,7 @@ template <typename T> struct block_sum_t {
 
   __device__ T sum(T item) {
     int const warp_id = threadIdx.x >> 5;
-    int const lane = threadIdx.x & 0x1f;
+    int const lane    = threadIdx.x & 0x1f;
     for (int o = WARPSIZE / 2; o > 0; o >>= 1) {
       item += __shfl_xor_sync(0xffffffff, item, o, WARPSIZE);
     }
@@ -109,13 +111,19 @@ template <typename T> struct block_sum_t {
 };
 } // namespace
 
-void abracadabra(float const *U, float const *A, float const *r,
-                 unsigned int *rows, int m, int n, int k, float *Q, float *z,
-                 float *gamma, mgpu::context_t &context) {
+void compute_gamma(float const *A,
+                   float const *T,
+                   float const *r,
+                   unsigned int *rows,
+                   int m,
+                   int n,
+                   float *q,
+                   float *gamma,
+                   mgpu::context_t &context) {
 
-  auto kernel = [] MGPU_DEVICE(int tid, int cta, float const *U, float const *A,
-                               float const *r, unsigned int *rows, int n, int k,
-                               float *Q, float *z, float *gamma) {
+  auto kernel = [] MGPU_DEVICE(int tid, int cta, float const *A, float const *T,
+                               float const *r, unsigned int *rows, int n,
+                               float *q, float *gamma) {
 
     __shared__ float reduced[WARPSIZE];
     if (tid < WARPSIZE)
@@ -124,81 +132,37 @@ void abracadabra(float const *U, float const *A, float const *r,
 
     // Select your row from the dictionary
     float const *a = A + rows[cta] * n;
-    float *q = Q + cta * n;
+    float const *t = T + rows[cta] * n;
+
+    float ar = 0;
+    float at = 0;
+    float tt = 0;
     for (int i = tid; i < n; i += blockDim.x) {
-      q[i] = 0;
-    }
-    for (int l = 0; l < k; ++l) {
-      float const *u = U + l * n;
-      float u2 = 0;
-      float ua = 0;
-      for (int i = tid; i < n; i += blockDim.x) {
-        u2 += u[i] * u[i];
-        ua += u[i] * a[i];
-      }
-
-      u2 = block_sum_t<float>(reduced).sum(u2);
-      ua = block_sum_t<float>(reduced).sum(ua);
-
-      if (!tid) {
-        reduced[0] = ua / max(u2, 1.0e-20f);
-      }
-      __syncthreads();
-      float scale = reduced[0];
-
-      for (int i = tid; i < n; i += blockDim.x) {
-        q[i] += scale * u[i];
-      }
+      ar += a[i] * r[i];
+      at += a[i] * t[i];
+      tt += t[i] * t[i];
     }
 
-    // Now we need to compute t and its dot product with a
-    float ta = 0;
-    float ra = 0;
-    for (int i = tid; i < n; i += blockDim.x) {
-      float ai = a[i];
-      float t = ai - q[i];
-      ra += r[i] * ai;
-      ta += ai * t;
-      q[i] = t;
-    }
-    // Got to make sure everybody is done reading "scale"
-    __syncthreads();
-    ta = block_sum_t<float>(reduced).sum(ta);
-    ra = block_sum_t<float>(reduced).sum(ra);
+    ar = block_sum_t<float>(reduced).sum(ar);
+    at = block_sum_t<float>(reduced).sum(at);
+    tt = block_sum_t<float>(reduced).sum(tt);
+
     if (!tid) {
-      reduced[0] = ta;
-      reduced[1] = ra;
-      z[cta] = ra;
+      float tmp  = ar / max(at, 1.0e-20f);
+      gamma[cta] = fabs(sqrt(tt) * tmp);
+      q[cta]     = tmp;
     }
-    __syncthreads();
-
-    float tainv = 1 / reduced[0];
-    float zj = reduced[1];
-    float q2 = 0;
-    for (int i = tid; i < n; i += blockDim.x) {
-      float qi = q[i] * tainv;
-      q2 += qi * qi;
-      q[i] = qi; // store the new q
-    }
-    q2 *= zj * zj;
-    __syncthreads(); // protect the `reduced` that's used for `tainv`, and `zj`
-    q2 = block_sum_t<float>(reduced).sum(q2);
-    if (!tid) {
-      gamma[cta] = q2;
-    }
-
-    // Here we could do a turnstile and compute the L-largest gamma`s
-    // on-the-fly, but that would be quite a bit of work if the dictionary
-    // has thousands of atoms.
   };
   int const num_ctas = m;
-  mgpu::cta_launch<256>(kernel, num_ctas, context, U, A, r, rows, n, k, Q, z,
-                        gamma);
+  mgpu::cta_launch<256>(kernel, num_ctas, context, A, T, r, rows, n, q, gamma);
 }
 
-template <int L>
-void largest_gammas(float const *gamma, int m, unsigned int *largest_rows,
-                    unsigned int *done, mgpu::context_t &context) {
+void largest_gammas(float const *gamma,
+                    int m,
+                    unsigned int *largest_rows,
+                    unsigned int *done,
+                    mgpu::context_t &context) {
+  enum { L = 1 };
   typedef mgpu::kv_array_t<float, uint, L> item_t;
 
   auto kernel = [] MGPU_DEVICE(int tid, int n, float const *gamma,
@@ -210,7 +174,7 @@ void largest_gammas(float const *gamma, int m, unsigned int *largest_rows,
 
     item_t item;
     mgpu::iterate<L>([&](int l) {
-      int const j = L * tid + l;
+      int const j  = L * tid + l;
       item.vals[l] = j;
       item.keys[l] = j < n ? gamma[j] : 0;
     });
@@ -269,30 +233,83 @@ void largest_gammas(float const *gamma, int m, unsigned int *largest_rows,
                       block_items.data(), done);
 }
 
-void update_ur(float const *Q, unsigned int const *indices, float const *z,
-               int offset, int n, int L, float *U, float *r,
-               mgpu::context_t &context) {
-  auto kernel = [] MGPU_DEVICE(int tid, float const *Q, float const *z,
-                               unsigned int const *indices, int offset, int n,
-                               int L, float *U, float *r) {
-    float ri = r[tid];
-    for (int l = 0; l < L; ++l) {
-      int const j = indices[l]; // inner indexing OKAY FIXME
-      float const qi = Q[j * n + tid];
-      ri -= z[j] * qi;
-      U[(offset + l) * n + tid] = qi;
-    }
-    r[tid] = ri;
-  };
+void update(float *T,
+            float const *A,
+            float const *q,
+            float *r,
+            unsigned int const *rows,
+            unsigned int const *indices,
+            unsigned int *done,
+            int n,
+            int m,
+            mgpu::context_t &context) {
+  auto kernel =
+      [] MGPU_DEVICE(int tid, int cta, float *T, float const *A, float const *q,
+                     float *r, unsigned int const *rows,
+                     unsigned int const *indices, unsigned int *done, int n) {
+        int index_max = indices[0];
+        if (cta == index_max)
+          return;
 
-  mgpu::transform(kernel, n, context, Q, z, indices, offset, n, L, U, r);
+        __shared__ float reduced[WARPSIZE];
+        if (tid < WARPSIZE)
+          reduced[tid] = 0;
+        __syncthreads();
+
+        float const *tmax = T + rows[index_max] * n;
+        float *t          = T + rows[cta] * n;
+        float const *a    = A + rows[cta] * n;
+        float qmax        = q[index_max];
+        float tt          = 0;
+        float ta          = 0;
+
+        // 1. compute t[j].dot(t[j])
+        // 2. compute t[j].dot(t[j])
+        for (int i = tid; i < n; i += blockDim.x) {
+          tt += tmax[i] * tmax[i];
+          ta += tmax[i] * a[i];
+        }
+        tt = block_sum_t<float>(reduced).sum(tt);
+        ta = block_sum_t<float>(reduced).sum(ta);
+
+        if (!tid) {
+          // 3. t[j].dot(a[j]) / t[j].dot(t[j])
+          reduced[0] = ta / tt;
+        }
+        __syncthreads();
+        float const scale = reduced[0];
+
+        // Turnstile
+        bool last_block = false;
+        if (!tid) {
+          last_block = atomicInc(done, 0xffffffff) == gridDim.x - 2;
+          if (last_block)
+            *done = 0;
+        }
+        last_block = __syncthreads_or(last_block);
+        // 4. t[j] -= t[j] - t[jmax] * t[j].dot(a[j]) / t[j].dot(t[j])
+        for (int i = tid; i < n; i += blockDim.x) {
+          t[i] -= scale * tmax[i];
+          if (last_block) {
+            // 5. r -= t[jmax] * qmax
+            r[i] = r[i] - tmax[i] * qmax;
+          }
+        }
+      };
+
+  int const num_ctas = m;
+  mgpu::cta_launch<256>(kernel, num_ctas, context, T, A, q, r, rows, indices,
+                        done, n);
 }
 
 // Assume rows is a list. updated_rows will be rows with elements at
 // the L indices specified in `selection` removed and appended at the end.
 // Both `rows` and `updated_rows` are arrays of length `m`.
-void udpate_partition(unsigned int const *rows, unsigned int const *selection,
-                      unsigned int *updated_rows, int m, int L,
+void update_partition(unsigned int const *rows,
+                      unsigned int const *selection,
+                      unsigned int *updated_rows,
+                      int m,
+                      int L,
                       mgpu::context_t &context) {
 
   auto kernel = [] MGPU_DEVICE(int tid, unsigned int const *rows,
@@ -304,7 +321,7 @@ void udpate_partition(unsigned int const *rows, unsigned int const *selection,
     for (; offset < L and selection[offset] <= (tid + offset); ++offset)
       ;
 
-    auto src_value = rows[tid + offset];
+    auto src_value    = rows[tid + offset];
     updated_rows[tid] = src_value;
 
     // First L threads ship the selected rows to the end of the array.
@@ -316,39 +333,36 @@ void udpate_partition(unsigned int const *rows, unsigned int const *selection,
   mgpu::transform(kernel, N, context, rows, selection, updated_rows, m, L);
 }
 
-std::vector<unsigned int> aols(float const *dictionary, float const *signal,
-                               int m, int n, int k, int L, float epsilon) {
-
+std::vector<unsigned int> aols_solve(float const *dictionary,
+                                     float const *signal,
+                                     int m,
+                                     int n,
+                                     int k,
+                                     double epsilon) {
   caching_context_t context;
-  cublasStatus_t status;
-  cublasHandle_t handle;
-  // cublasSetStream(handle, context.stream());
-  status = cublasCreate(&handle);
-  assert(CUBLAS_STATUS_SUCCESS == status);
 
-  // Q can maximally take size k * L x n
-  mgpu::mem_t<float> U((k * L) * n, context);
-  mgpu::mem_t<float> Q(m * n, context);
   mgpu::mem_t<float> A(n * m, context);
+  mgpu::mem_t<float> T(n * m, context);
   mgpu::mem_t<float> y(n, context);
   mgpu::mem_t<float> r(n, context);
-  mgpu::mem_t<float> z(m, context);
+  mgpu::mem_t<float> q(m, context);
   mgpu::mem_t<float> gamma(m, context);
   mgpu::mem_t<unsigned int> rows(m, context);
   mgpu::mem_t<unsigned int> updated_rows(m, context);
-  mgpu::mem_t<unsigned int> largest_rows(L, context);
+  mgpu::mem_t<unsigned int> indices(1, context);
   mgpu::mem_t<unsigned int> done(1, context);
 
   cudaMemset(done.data(), 0x0, done.size() * sizeof(unsigned int));
 
   cudaError_t error = cudaSuccess;
-  error = mgpu::htod(A.data(), dictionary, n * m);
+  error             = mgpu::htod(A.data(), dictionary, n * m);
+  assert(cudaSuccess == error);
+  error = mgpu::dtod(T.data(), A.data(), n * m);
   assert(cudaSuccess == error);
   error = mgpu::htod(y.data(), signal, n);
   assert(cudaSuccess == error);
-
-  // initialize r <- y
   error = mgpu::dtod(r.data(), y.data(), n);
+  assert(cudaSuccess == error);
 
   std::vector<unsigned int> I(m);
   // initial set of columns
@@ -358,60 +372,28 @@ std::vector<unsigned int> aols(float const *dictionary, float const *signal,
   std::vector<int> S;
 
   int ms = m;
-  for (int i = 0; i < std::min(k, std::min(n, m) / L); ++i, ms -= L) {
+  for (int i = 0; i < std::min(k, std::min(n, m)); ++i, ms--) {
     // This will compute the new gammas, and z,
-    abracadabra(U.data(), A.data(), r.data(), rows.data(), ms, n, L * i,
-                Q.data(), z.data(), gamma.data(), context);
-
-    switch (L) {
-    case 1:
-      largest_gammas<1>(gamma.data(), ms, largest_rows.data(), done.data(),
-                        context);
-      break;
-    case 2:
-      largest_gammas<2>(gamma.data(), ms, largest_rows.data(), done.data(),
-                        context);
-      break;
-    case 3:
-      largest_gammas<3>(gamma.data(), ms, largest_rows.data(), done.data(),
-                        context);
-      break;
-    case 6:
-      largest_gammas<6>(gamma.data(), ms, largest_rows.data(), done.data(),
-                        context);
-      break;
-    default:
-      throw std::runtime_error("Only L=1,2,3,6 are supported.");
-    }
-#if 1
-    auto hrows = mgpu::from_mem(rows);
-    auto now = mgpu::from_mem(largest_rows);
-    auto hgamma = mgpu::from_mem(gamma);
-    printf("gmamma: ");
-    for (auto v : hgamma)
-      printf("%f ", std::sqrt(v));
-    printf("\n");
-    printf("indices ");
-    for (auto v : now)
-      printf("%i ", hrows[v]);
-    printf("\n");
-#endif
-    // Now we have the indices of the L largest rows in largest_rows.
+    compute_gamma(A.data(), T.data(), r.data(), rows.data(), ms, n, q.data(),
+                  gamma.data(), context);
+    largest_gammas(gamma.data(), ms, indices.data(), done.data(), context);
+    // Now we have the indices of the L largest rows in indices.
     // We should remove them from the active set and add them to the S set.
-    udpate_partition(rows.data(), largest_rows.data(), updated_rows.data(), m,
-                     L, context);
+    update(T.data(), A.data(), q.data(), r.data(), rows.data(), indices.data(),
+           done.data(), n, ms, context);
+    update_partition(rows.data(), indices.data(), updated_rows.data(), m, 1,
+                     context);
     updated_rows.swap(rows);
-#if 0
-    auto new_rows = mgpu::from_mem(rows);
-    printf("new rows: ");
-    for (auto v : new_rows)
-      printf("%i ", v);
-    printf("\n");
-#endif
-    // Now update r and u
-    update_ur(Q.data(), largest_rows.data(), z.data(), i * L, n, L, U.data(),
-              r.data(), context);
-    // TODO: add epsilon-based early exit
+
+    if (epsilon > 0) {
+      auto hr     = mgpu::from_mem(r);
+      double rrms = 0;
+      for (auto x : hr) {
+        rrms += x * x;
+      }
+      if (std::sqrt(rrms / hr.size()) < epsilon)
+        break;
+    }
   }
   // Done, now transfer the result which is the top (m - ms) values of the
   // `rows` array.
