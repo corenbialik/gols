@@ -62,6 +62,12 @@ gols_solve(float const *dictionary,
            int L,
            bool solve_lstsq = false);
 
+std::vector<unsigned int> aols_solve(float const *dictionary,
+                                     float const *signal,
+                                     int n,
+                                     int m,
+                                     int k,
+                                     double epsilon);
 extern "C" {
 #endif
 #include <stdbool.h>
@@ -78,6 +84,14 @@ void gols_solve(float const *dictionary,
                 int *best_rows,
                 float *x,
                 bool solve_lstsq);
+
+void aols_solve(float const *dictionary,
+                float const *signal,
+                int n,
+                int m,
+                int k,
+                double epsilon,
+                unsigned int *best_rows);
 #ifdef __cplusplus
 }
 #endif

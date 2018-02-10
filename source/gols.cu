@@ -22,8 +22,9 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-#include "caching_context.hxx"
 #include "gols.hxx"
+#include "caching_context.hxx"
+#include "common.hxx"
 #include <cublas_v2.h>
 #include <cusolverDn.h>
 #include <moderngpu/context.hxx>
@@ -35,35 +36,6 @@
 #endif
 
 namespace {
-
-enum { WARPSIZE = 32 };
-
-// Simple block reduction.
-// Needs to be initialized with a __shared__ buffer of size no less than
-// ceil(blockDim.x / WARPSIZE)
-template <typename T> struct block_sum_t {
-  T *reduced;
-  __device__ block_sum_t(T *reduced) : reduced(reduced) {}
-
-  __device__ T sum(T item) {
-    int const warp_id = threadIdx.x >> 5;
-    int const lane    = threadIdx.x & 0x1f;
-    for (int o = WARPSIZE / 2; o > 0; o >>= 1) {
-      item += __shfl_xor_sync(0xffffffff, item, o, WARPSIZE);
-    }
-    if (!lane) {
-      reduced[warp_id] = item;
-    }
-    __syncthreads();
-    if (!warp_id) {
-      item = reduced[lane];
-      for (int o = WARPSIZE / 2; o > 0; o >>= 1) {
-        item += __shfl_xor_sync(0xffffffff, item, o, WARPSIZE);
-      }
-    }
-    return item;
-  }
-};
 
 // Solve the linear system `A` x = `b` using QR factorization.
 // Only supports the case where the system is not over-determined, which is

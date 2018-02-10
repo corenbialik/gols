@@ -22,94 +22,16 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 
-#include "caching_context.hxx"
 #include "gols.hxx"
+#include "caching_context.hxx"
+#include "common.hxx"
 #include <cublas_v2.h>
 #include <cusolverDn.h>
 #include <moderngpu/context.hxx>
 #include <moderngpu/memory.hxx>
-#include <moderngpu/sort_networks.hxx>
 #include <moderngpu/transform.hxx>
 #include <type_traits>
 
-namespace {
-
-enum { WARPSIZE = 32 };
-
-template <int L> struct n_largest_t {
-  mgpu::kv_array_t<float, uint, L> *reduced;
-
-  __device__ __forceinline__
-  n_largest_t(mgpu::kv_array_t<float, uint, L> *buffer)
-      : reduced(buffer) {}
-
-  __device__ __forceinline__ void
-  warp_max(mgpu::kv_array_t<float, uint, L> &item) {
-    mgpu::kv_array_t<float, uint, 2 * L> together;
-    mgpu::iterate<L>([&](int l) {
-      together.keys[l] = item.keys[l];
-      together.vals[l] = item.vals[l];
-    });
-    for (int o = WARPSIZE / 2; o > 0; o >>= 1) {
-      mgpu::iterate<L>([&](int l) {
-        together.keys[L + l] =
-            __shfl_xor_sync(0xffffffff, together.keys[l], o, WARPSIZE);
-        together.vals[L + l] =
-            __shfl_xor_sync(0xffffffff, together.vals[l], o, WARPSIZE);
-      });
-      together =
-          mgpu::odd_even_sort(together, [](float a, float b) { return a > b; });
-    }
-
-    mgpu::iterate<L>([&](int l) {
-      item.keys[l] = together.keys[l];
-      item.vals[l] = together.vals[l];
-    });
-  }
-
-  // The first warp will have the L-largest items stored in item.
-  __device__ __forceinline__ void max(mgpu::kv_array_t<float, uint, L> &item) {
-    int const warp_id = threadIdx.x >> 5;
-    int const lane    = threadIdx.x & 0x1f;
-    warp_max(item);
-    if (!lane) {
-      reduced[warp_id] = item;
-    }
-    __syncthreads();
-    if (!warp_id) {
-      item = reduced[lane];
-      warp_max(item);
-    }
-  }
-};
-
-// Simple block reduction.
-// Needs to be initialized with a __shared__ buffer of size no less than
-// ceil(blockDim.x / WARPSIZE)
-template <typename T> struct block_sum_t {
-  T *reduced;
-  __device__ block_sum_t(T *reduced) : reduced(reduced) {}
-
-  __device__ T sum(T item) {
-    int const warp_id = threadIdx.x >> 5;
-    int const lane    = threadIdx.x & 0x1f;
-    for (int o = WARPSIZE / 2; o > 0; o >>= 1) {
-      item += __shfl_xor_sync(0xffffffff, item, o, WARPSIZE);
-    }
-    if (!lane) {
-      reduced[warp_id] = item;
-    }
-    __syncthreads();
-    if (!warp_id) {
-      item = reduced[lane];
-      for (int o = WARPSIZE / 2; o > 0; o >>= 1) {
-        item += __shfl_xor_sync(0xffffffff, item, o, WARPSIZE);
-      }
-    }
-    return item;
-  }
-};
-} // namespace
 
 void compute_gamma(float const *A,
                    float const *T,
@@ -169,6 +91,9 @@ void largest_gammas(float const *gamma,
                                unsigned int *largest_rows, item_t *block_items,
                                unsigned int *done) {
     __shared__ item_t buffer[WARPSIZE];
+    if (threadIdx.x < WARPSIZE)
+      buffer[threadIdx.x] = item_t();
+    __syncthreads();
 
     n_largest_t<L> n_largest(buffer);
 
@@ -183,6 +108,7 @@ void largest_gammas(float const *gamma,
     if (!threadIdx.x) {
       block_items[blockIdx.x] = item;
     }
+    __threadfence();
 
     // Turnstile
     bool last_block = false;
@@ -335,8 +261,8 @@ void update_partition(unsigned int const *rows,
 
 std::vector<unsigned int> aols_solve(float const *dictionary,
                                      float const *signal,
-                                     int m,
                                      int n,
+                                     int m,
                                      int k,
                                      double epsilon) {
   caching_context_t context;
@@ -361,7 +287,7 @@ std::vector<unsigned int> aols_solve(float const *dictionary,
   assert(cudaSuccess == error);
   error = mgpu::htod(y.data(), signal, n);
   assert(cudaSuccess == error);
-  error = mgpu::dtod(r.data(), y.data(), n);
+  error = mgpu::htod(r.data(), signal, n);
   assert(cudaSuccess == error);
 
   std::vector<unsigned int> I(m);
@@ -400,4 +326,16 @@ std::vector<unsigned int> aols_solve(float const *dictionary,
   auto result_rows = mgpu::from_mem(rows);
   result_rows.erase(result_rows.begin(), result_rows.begin() + ms);
   return result_rows;
+}
+
+void aols_solve(float const *dictionary,
+                float const *signal,
+                int n,
+                int m,
+                int k,
+                double epsilon,
+                unsigned int *best_rows) {
+
+  auto result = aols_solve(dictionary, signal, n, m, k, epsilon);
+  std::copy(result.begin(), result.end(), best_rows);
 }
